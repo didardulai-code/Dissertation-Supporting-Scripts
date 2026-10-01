@@ -1,0 +1,121 @@
+var SITES = [
+
+  ['Sefid Rud',       'North/Caspian',    'Mixed', 'Irrigation/hydro',    49.385,  36.766,  20],
+  ['Shahid Rajaei',   'North/Caspian',    'Mixed', 'Supply/irrigation',   53.316,  36.201,  20],
+  ['Aras',            'Northwest',        'Snow',  'Irrigation/hydro',    45.418,  39.156,  30],
+  ['Zarrineh Rud',    'Northwest',        'Snow',  'Supply/irrigation',   46.212,  36.470,  40],
+  ['Mahabad',         'Northwest',        'Snow',  'Irrigation',          45.700,  36.812,  20],
+  ['Lake Urmia',      'Northwest',        'Snow',  'TERMINAL',            45.500,  37.700,  90],
+  ['Karkheh',         'Zagros/southwest', 'Mixed', 'Irrigation/flood',    48.157,  32.640,  35],
+  ['Dez',             'Zagros/southwest', 'Snow',  'Hydro/irrigation',    48.460,  32.563,  30],
+  ['Upper Gotvand',   'Zagros/southwest', 'Snow',  'Hydro',              48.815,  32.253,  30],
+  ['Karun-3',         'Zagros/southwest', 'Snow',  'Hydro',              50.320,  31.815,  30],
+  ['Seymareh',        'Zagros/west',      'Mixed', 'Hydro',              47.505,  33.115,  35],
+  ['Kowsar',          'Zagros/south',     'Mixed', 'Supply/irrigation',   51.190,  30.395,  45],
+  ['Zayandeh Rud',    'Central plateau',  'Snow',  'Supply/irrigation',   50.740,  32.740,  25],
+  ['Gavkhouni',       'Central plateau',  'Snow',  'TERMINAL',            52.800,  32.300,  45],
+  ['Latyan',          'Central plateau',  'Snow',  'Supply',              51.680,  35.790,  15],
+  ['Amir Kabir',      'Central plateau',  'Snow',  'Supply',              51.100,  35.955,  15],
+  ['Lar',             'Central plateau',  'Snow',  'Supply',              51.960,  35.860,  20],
+  ['Taleghan',        'Central plateau',  'Snow',  'Supply/irrigation',   50.760,  36.180,  20],
+  ['15 Khordad',      'Central plateau',  'Mixed', 'Irrigation',          50.480,  35.030,  40],
+  ['Doroudzan',       'South/Fars',       'Mixed', 'Supply/irrigation',   52.430,  30.210,  25],
+  ['Bakhtegan-Tashk', 'South/Fars',       'Mixed', 'TERMINAL',            53.500,  29.400,  80],
+  ['Jiroft',          'Southeast',        'Mixed', 'Irrigation/supply',   57.320,  28.780,  50],
+  ['Esteghlal Minab', 'South coast',      'Rain',  'Supply',              57.100,  27.320,  25],
+  ['Doosti',          'East/Khorasan',    'Mixed', 'Supply',              60.850,  35.940,  45],
+  ['Chah Nimeh',      'Southeast/Sistan', 'Rain',  'Supply/irrigation',   61.520,  30.850,  30],
+  ['Hamoun',          'Southeast/Sistan', 'Rain',  'TERMINAL',            61.300,  31.150,  80]
+];
+
+var CLUSTER_SCALE = 120;
+var MEASURE_SCALE = 30;
+var MIN_AREA_KM2  = 5.0;
+var DRIVE_FOLDER  = 'iran war project';
+var TILE_SCALE    = 4;
+
+var gsw = ee.Image('JRC/GSW1_4/GlobalSurfaceWater');
+var occ = gsw.select('occurrence');
+var maxExtent = gsw.select('max_extent');
+
+function largestBody(pt, radius_m) {
+  var search = pt.buffer(radius_m);
+
+  var vec = maxExtent.selfMask().reduceToVectors({
+    geometry: search,
+    scale: CLUSTER_SCALE,
+    geometryType: 'polygon',
+    eightConnected: true,
+    labelProperty: 'w',
+    maxPixels: 1e10,
+    bestEffort: false
+  });
+
+  var withArea = vec.map(function (f) {
+    return f.set('a', f.geometry().area(30));
+  });
+
+  var n = withArea.size();
+  var best = ee.Feature(ee.Algorithms.If(
+    n.gt(0),
+    withArea.sort('a', false).first(),
+    ee.Feature(search, {a: 0})
+  ));
+  return {geom: best.geometry(), found: n.gt(0)};
+}
+
+function areaWithin(mask, geom) {
+  return ee.Number(mask.multiply(ee.Image.pixelArea()).reduceRegion({
+    reducer: ee.Reducer.sum(), geometry: geom, scale: MEASURE_SCALE,
+    maxPixels: 1e11, tileScale: TILE_SCALE
+  }).values().get(0)).divide(1e6);
+}
+
+var rows = SITES.map(function (s) {
+  var pt = ee.Geometry.Point([s[4], s[5]]);
+  var b  = largestBody(pt, s[6] * 1000);
+  var g  = b.geom;
+
+  var aMax = areaWithin(maxExtent.gt(0), g);
+  var a25  = areaWithin(occ.gte(25), g);
+  var a50  = areaWithin(occ.gte(50), g);
+
+  var cen = g.centroid(30);
+
+  var offset_km = pt.distance(cen, 30).divide(1000);
+
+  return ee.Feature(null, {
+    site: s[0], region: s[1], input: s[2], fn: s[3],
+    lon_nominal: s[4], lat_nominal: s[5], search_km: s[6],
+    lon_found: ee.Number(cen.coordinates().get(0)),
+    lat_found: ee.Number(cen.coordinates().get(1)),
+    offset_km: offset_km,
+    area_max_km2: aMax,
+    area_occ25_km2: a25,
+    area_occ50_km2: a50,
+
+    stability: a50.divide(aMax.max(0.0001)),
+    passes_size: aMax.gte(MIN_AREA_KM2),
+    terminal: s[3] === 'TERMINAL'
+  });
+});
+
+print('sites: ' + SITES.length);
+print(ee.Feature(rows[7]));
+
+Export.table.toDrive({
+  collection: ee.FeatureCollection(rows),
+  description: 'Iran_SW_StageA2_footprints',
+  folder: DRIVE_FOLDER,
+  fileNamePrefix: 'Iran_SW_StageA2_footprints',
+  fileFormat: 'CSV',
+  selectors: ['site', 'region', 'input', 'fn',
+              'lon_nominal', 'lat_nominal', 'search_km',
+              'lon_found', 'lat_found', 'offset_km',
+              'area_max_km2', 'area_occ25_km2', 'area_occ50_km2',
+              'stability', 'passes_size', 'terminal']
+});
+
+print('One task created. Read offset_km first: anything above about 15 km '
+    + 'means the search found the wrong body of water and that site needs a '
+    + 'corrected coordinate before it is admitted.');

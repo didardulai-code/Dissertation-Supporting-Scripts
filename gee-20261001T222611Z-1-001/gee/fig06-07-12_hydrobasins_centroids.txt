@@ -1,0 +1,40 @@
+var MIN_BASIN_AREA_KM2 = 500;
+
+var iran = ee.FeatureCollection('USDOS/LSIB_SIMPLE/2017')
+             .filter(ee.Filter.eq('country_na', 'Iran')).first().geometry();
+
+var basins = ee.FeatureCollection('WWF/HydroSHEDS/v1/Basins/hybas_5')
+               .filterBounds(iran)
+               .filter(ee.Filter.gte('SUB_AREA', MIN_BASIN_AREA_KM2));
+
+print('basins returned:', basins.size());
+
+var rows = basins.map(function (f) {
+
+  var c = f.geometry().centroid(1000).coordinates();
+  return ee.Feature(null, {
+    hybas_id:     f.get('HYBAS_ID'),
+    sub_area_km2: f.get('SUB_AREA'),
+    lon:          ee.Number(c.get(0)),
+    lat:          ee.Number(c.get(1)),
+    next_down:    f.get('NEXT_DOWN'),
+    pfaf_id:      f.get('PFAF_ID')
+  });
+});
+
+Export.table.toDrive({
+  collection:     rows,
+  description:    'Iran_basins_lev5_centroids',
+  folder:         'iran war project',
+  fileNamePrefix: 'Iran_basins_lev5_centroids',
+  fileFormat:     'CSV',
+  selectors:      ['hybas_id', 'sub_area_km2', 'lon', 'lat', 'next_down', 'pfaf_id']
+});
+
+Export.table.toDrive({
+  collection:     basins.select(['HYBAS_ID', 'SUB_AREA']),
+  description:    'Iran_basins_lev5_geometry',
+  folder:         'iran war project',
+  fileNamePrefix: 'Iran_basins_lev5_geometry',
+  fileFormat:     'GeoJSON'
+});
