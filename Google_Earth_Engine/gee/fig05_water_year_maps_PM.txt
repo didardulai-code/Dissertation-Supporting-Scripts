@@ -1,0 +1,223 @@
+var WATER_YEARS = [2020, 2021, 2022, 2023, 2024, 2025];
+
+var EXPORT_CLIMATOLOGY = true;
+
+var CLIM_FIRST = 1991;
+var CLIM_LAST  = 2020;
+
+var SCALE        = 11132;
+var CHIRPS_SCALE = 5566;
+var TILE_SCALE   = 8;
+
+var DRIVE_FOLDER = 'Iran_PM_maps';
+var PRINT_DIAGNOSTICS = false;
+
+var SUB_SEASON = {
+  SON:  {from: 9,  to: 11, spans: false},
+  DJF:  {from: 12, to: 2,  spans: true},
+  MAM:  {from: 3,  to: 5,  spans: false},
+  June: {from: 6,  to: 6,  spans: false}
+};
+var SUB_ORDER = ['SON', 'DJF', 'MAM', 'June'];
+
+var iran = ee.FeatureCollection('FAO/GAUL/2015/level0')
+             .filter(ee.Filter.eq('ADM0_NAME', 'Iran  (Islamic Republic of)'));
+var geom = iran.geometry();
+
+var era5 = ee.ImageCollection('ECMWF/ERA5_LAND/DAILY_AGGR')
+             .select(['temperature_2m', 'temperature_2m_min',
+                      'temperature_2m_max', 'dewpoint_temperature_2m',
+                      'u_component_of_wind_10m', 'v_component_of_wind_10m',
+                      'surface_solar_radiation_downwards_sum',
+                      'surface_pressure']);
+var chirps = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY').select('precipitation');
+
+var CHIRPS_PROJ = chirps.first().projection();
+var ERA5_PROJ   = ee.ImageCollection('ECMWF/ERA5_LAND/DAILY_AGGR')
+                    .first().select('temperature_2m').projection();
+
+var PHI = ee.Image.pixelLonLat().select('latitude')
+            .multiply(Math.PI / 180.0)
+            .setDefaultProjection(ERA5_PROJ);
+
+var ELEV = ee.Image('USGS/SRTMGL1_003').select('elevation')
+             .resample('bilinear').reproject({crs: ERA5_PROJ})
+             .rename('elevation_m');
+
+function extraterrestrialRadiationMJ(doy) {
+  var b   = ee.Number(doy).multiply(2 * Math.PI / 365.0);
+  var dr  = ee.Image.constant(b.cos().multiply(0.033).add(1));
+  var dec = ee.Image.constant(b.subtract(1.39).sin().multiply(0.409));
+  var ws  = PHI.tan().multiply(dec.tan()).multiply(-1).clamp(-1, 1).acos();
+  return ws.multiply(PHI.sin()).multiply(dec.sin())
+           .add(PHI.cos().multiply(dec.cos()).multiply(ws.sin()))
+           .multiply(dr).multiply(0.0820).multiply(24 * 60 / Math.PI)
+           .rename('Ra_MJ');
+}
+
+function saturationVapourPressure(t) {
+  return t.multiply(17.27).divide(t.add(237.3)).exp().multiply(0.6108);
+}
+
+function dailyPenmanMonteith(img) {
+  var Tmax = img.select('temperature_2m_max').subtract(273.15);
+  var Tmin = img.select('temperature_2m_min').subtract(273.15);
+  var T    = Tmax.add(Tmin).multiply(0.5);
+  var Tdew = img.select('dewpoint_temperature_2m').subtract(273.15);
+
+  var es  = saturationVapourPressure(Tmax)
+              .add(saturationVapourPressure(Tmin)).multiply(0.5);
+  var ea  = saturationVapourPressure(Tdew);
+  var vpd = es.subtract(ea).max(0);
+
+  var delta = saturationVapourPressure(T).multiply(4098)
+                .divide(T.add(237.3).pow(2));
+  var gamma = img.select('surface_pressure').divide(1000)
+                .multiply(0.000665);
+
+  var wind10to2 = 4.87 / Math.log((67.8 * 10) - 5.42);
+  var u2 = img.select('u_component_of_wind_10m')
+              .hypot(img.select('v_component_of_wind_10m'))
+              .multiply(wind10to2);
+
+  var Rs  = img.select('surface_solar_radiation_downwards_sum')
+              .divide(1e6).max(0);
+  var doy = ee.Date(img.get('system:time_start'))
+              .getRelative('day', 'year').add(1);
+  var Ra  = extraterrestrialRadiationMJ(doy);
+  var Rso = ELEV.multiply(2e-5).add(0.75).multiply(Ra).max(1e-6);
+  var Rns = Rs.multiply(0.77);
+
+  var TmaxK = Tmax.add(273.16);
+  var TminK = Tmin.add(273.16);
+  var tempTerm = TmaxK.pow(4).add(TminK.pow(4)).multiply(0.5);
+  var humTerm  = ea.sqrt().multiply(-0.14).add(0.34);
+  var relSol   = Rs.divide(Rso).min(1.0);
+  var cloud    = relSol.multiply(1.35).subtract(0.35);
+  var Rnl = tempTerm.multiply(4.903e-9).multiply(humTerm).multiply(cloud);
+  var Rn  = Rns.subtract(Rnl);
+  var G   = ee.Image.constant(0);
+
+  var tterm = ee.Image.constant(900).divide(T.add(273));
+  var num = delta.multiply(0.408).multiply(Rn.subtract(G))
+              .add(gamma.multiply(tterm).multiply(u2).multiply(vpd));
+  var den = delta.add(gamma.multiply(u2.multiply(0.34).add(1)));
+  return num.divide(den).max(0).rename('et0');
+}
+
+function chirpsTotal(start, end) {
+  return chirps.filterDate(start, end).sum()
+               .setDefaultProjection(CHIRPS_PROJ)
+               .reduceResolution({reducer: ee.Reducer.mean(), maxPixels: 1024})
+               .reproject({crs: 'EPSG:4326', scale: SCALE});
+}
+
+function petTotal(start, end) {
+  return era5.filterDate(start, end).map(dailyPenmanMonteith).sum();
+}
+
+function subSeasonWindow(name, seasonYear) {
+  var d = SUB_SEASON[name];
+  var start = d.spans ? ee.Date.fromYMD(seasonYear - 1, d.from, 1)
+                      : ee.Date.fromYMD(seasonYear, d.from, 1);
+  var end   = ee.Date.fromYMD(seasonYear, d.to, 1).advance(1, 'month');
+  return {start: start, end: end};
+}
+
+function waterYearWindow(septemberYear) {
+  return {start: ee.Date.fromYMD(septemberYear,     9, 1),
+          end:   ee.Date.fromYMD(septemberYear + 1, 7, 1)};
+}
+
+function areaWeightedMean(img, scale) {
+  var area  = ee.Image.pixelArea();
+  var names = img.bandNames();
+  var areas = img.mask().multiply(area).rename(
+    names.map(function (n) { return ee.String(n).cat('_area'); }));
+  var sums = img.multiply(area).addBands(areas).reduceRegion({
+    reducer: ee.Reducer.sum(), geometry: geom, scale: scale,
+    maxPixels: 1e13, tileScale: TILE_SCALE, bestEffort: false});
+  return ee.Dictionary.fromLists(names, names.map(function (n) {
+    var nn = ee.String(n);
+    return ee.Number(sums.get(nn)).divide(ee.Number(sums.get(nn.cat('_area'))));
+  }));
+}
+
+var CLIM_CHUNKS = [[1991, 2000], [2001, 2010], [2011, 2020]];
+
+function buildSubSeasonClimatology(name, y0, y1) {
+  var pImgs = [], petImgs = [];
+  for (var y = y0; y <= y1; y++) {
+    var w = subSeasonWindow(name, y);
+    pImgs.push(chirpsTotal(w.start, w.end));
+    petImgs.push(petTotal(w.start, w.end));
+  }
+  return ee.ImageCollection(pImgs).mean().rename('p_clim_mm')
+           .addBands(ee.ImageCollection(petImgs).mean().rename('pet_clim_mm'))
+           .toFloat().clip(geom);
+}
+
+function buildWaterYear(septemberYear) {
+  var w = waterYearWindow(septemberYear);
+  return chirpsTotal(w.start, w.end).rename('p_mm')
+           .addBands(petTotal(w.start, w.end).rename('pet_mm'))
+           .toFloat().clip(geom);
+}
+
+print('Tasks to be created: ' +
+      ((EXPORT_CLIMATOLOGY ? SUB_ORDER.length * CLIM_CHUNKS.length : 0) +
+       WATER_YEARS.length));
+print('Climatology is split into ' + CLIM_CHUNKS.length + ' year-chunks per ' +
+      'sub-season so no single task is heavy. Water-year tasks are one window ' +
+      'each and finish quickly.');
+
+if (EXPORT_CLIMATOLOGY) {
+  SUB_ORDER.forEach(function (name) {
+    CLIM_CHUNKS.forEach(function (chunk) {
+
+      var y0 = chunk[0], y1 = chunk[1];
+      var img = buildSubSeasonClimatology(name, y0, y1);
+      var out = 'Iran_clim_' + name + '_' + y0 + '_' + y1 + '_P_PET';
+
+      Export.image.toDrive({
+        image: img, description: out, folder: DRIVE_FOLDER,
+        fileNamePrefix: out, region: geom, scale: SCALE, crs: 'EPSG:4326',
+        maxPixels: 1e13, fileFormat: 'GeoTIFF'
+      });
+      print('Task created: ' + out);
+
+      if (!PRINT_DIAGNOSTICS) { return; }
+      areaWeightedMean(img, SCALE).evaluate(function (v, err) {
+        if (err) { print(name + ' ' + y0 + '-' + y1 +
+                         ' climatology check failed: ' + err); return; }
+        print('--- clim ' + name + ' ' + y0 + '-' + y1 + ' national ---');
+        print('  P        ' + v.p_clim_mm.toFixed(2) + ' mm');
+        print('  ET0 PM   ' + v.pet_clim_mm.toFixed(2) + ' mm');
+      });
+    });
+  });
+}
+
+WATER_YEARS.forEach(function (y) {
+
+  var img = buildWaterYear(y);
+  var out = 'Iran_WY_' + y + '_SepJun_P_PET';
+
+  Export.image.toDrive({
+    image: img, description: out, folder: DRIVE_FOLDER,
+    fileNamePrefix: out, region: geom, scale: SCALE, crs: 'EPSG:4326',
+    maxPixels: 1e13, fileFormat: 'GeoTIFF'
+  });
+  print('Task created: ' + out + '   (Sep ' + y + ' - Jun ' + (y + 1) + ')');
+
+  if (!PRINT_DIAGNOSTICS) { return; }
+  areaWeightedMean(img, SCALE).evaluate(function (v, err) {
+    if (err) { print('WY ' + y + ' check failed: ' + err); return; }
+    print('--- WY ' + y + ' (Sep ' + y + ' - Jun ' + (y + 1) + ') national ---');
+    print('  P        ' + v.p_mm.toFixed(2) + ' mm');
+    print('  ET0 PM   ' + v.pet_mm.toFixed(2) + ' mm');
+  });
+});
+
+print('Open the Tasks tab and run them all. The tasks are independent: one ' +
+      'failing does not affect the others.');

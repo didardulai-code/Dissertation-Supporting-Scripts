@@ -1,0 +1,348 @@
+var DO_BASINS   = true;
+var DO_ELEVBAND = false;
+
+(function () {
+  if (DO_BASINS && DO_ELEVBAND) {
+    throw new Error('Set one of DO_BASINS / DO_ELEVBAND true at a time.');
+  }
+})();
+
+var Y0 = 2003;
+var Y1 = 2026;
+var SERIES_END_EXCL = '2026-07-01';
+
+var BLOCK_YEARS = 5;
+var BLOCKS = [];
+for (var by = Y0; by <= Y1; by += BLOCK_YEARS) {
+  BLOCKS.push([by, Math.min(by + BLOCK_YEARS - 1, Y1)]);
+}
+
+var SNOW_THRESH      = 40;
+var SNOW_THRESH_LOW  = 30;
+var SNOW_THRESH_HIGH = 50;
+var WINDOW_DAYS = 8;
+
+var SCALE = 500;
+var TILE_SCALE = 4;
+var DRIVE_FOLDER = 'iran war project';
+
+var MIN_BASIN_AREA_KM2 = 500;
+var MIN_MEAN_ELEV_M    = 800;
+
+var terraColl = ee.ImageCollection('MODIS/061/MOD10A1');
+var aquaColl  = ee.ImageCollection('MODIS/061/MYD10A1');
+
+function withPriority(coll, base, srcCode) {
+  return coll.map(function (im) {
+    var v     = im.select('NDSI_Snow_Cover').toInt16();
+    var valid = v.gte(0).and(v.lte(100));
+
+    return v.addBands(valid.multiply(2).add(base).rename('prio').toInt16())
+            .addBands(ee.Image.constant(srcCode).rename('src').toInt16())
+            .set('system:time_start', im.get('system:time_start'));
+  });
+}
+
+var MERGE_FROM_MS = Date.UTC(2003, 0, 1);
+
+var snowColl = terraColl;
+var dem      = ee.Image('USGS/SRTMGL1_003').select('elevation');
+
+var forest = ee.ImageCollection('MODIS/061/MCD12Q1')
+  .filterDate('2020-01-01', '2021-01-01').first()
+  .select('LC_Type1');
+var isForest = forest.gte(1).and(forest.lte(5));
+var iran     = ee.FeatureCollection('USDOS/LSIB_SIMPLE/2017')
+                 .filter(ee.Filter.eq('country_na', 'Iran')).first().geometry();
+
+var basinsAll = ee.FeatureCollection('WWF/HydroSHEDS/v1/Basins/hybas_5')
+                  .filterBounds(iran);
+
+function buildBasins() {
+  return basinsAll
+  .filter(ee.Filter.gte('SUB_AREA', MIN_BASIN_AREA_KM2))
+  .map(function (f) {
+
+    var z = dem.reduceRegion({
+      reducer: ee.Reducer.mean().combine(
+                 ee.Reducer.percentile([10, 50, 90]), '', true),
+      geometry: f.geometry(), scale: 1000,
+      maxPixels: 1e10, tileScale: TILE_SCALE
+    });
+    var fr = isForest.rename('f').reduceRegion({
+      reducer: ee.Reducer.mean(), geometry: f.geometry(), scale: 500,
+      maxPixels: 1e10, tileScale: TILE_SCALE
+    }).get('f');
+    return f.set({
+      mean_elev_m: z.get('elevation_mean'),
+      elev_p10: z.get('elevation_p10'),
+      elev_p50: z.get('elevation_p50'),
+      elev_p90: z.get('elevation_p90'),
+      forest_frac: fr
+    });
+  })
+  .filter(ee.Filter.gte('mean_elev_m', MIN_MEAN_ELEV_M));
+}
+
+var basins = null;
+
+function snowBands(img) {
+  var v = img.select('NDSI_Snow_Cover');
+
+  var valid = v.gte(0).and(v.lte(100));
+
+  var s40 = v.gte(SNOW_THRESH).and(valid);
+  var s30 = v.gte(SNOW_THRESH_LOW).and(valid);
+  var s50 = v.gte(SNOW_THRESH_HIGH).and(valid);
+
+  var aquaFill = valid.and(img.select('src').eq(0));
+  return valid.rename('valid').unmask(0, false)
+    .addBands(s40.rename('s40').unmask(0, false))
+    .addBands(s30.rename('s30').unmask(0, false))
+    .addBands(s50.rename('s50').unmask(0, false))
+    .addBands(aquaFill.rename('aqua').unmask(0, false))
+    .addBands(ee.Image.constant(1).rename('all').toByte());
+}
+
+var ZERO6 = ee.Image.constant([0, 0, 0, 0, 0, 0])
+              .rename(['valid', 's40', 's30', 's50', 'aqua', 'all']).toFloat();
+
+function mergedDailyColl(d0, d1) {
+  var s0 = ee.Date(d0);
+  var nd = ee.Date(d1).difference(s0, 'day').round();
+  var lst = ee.List.sequence(0, nd.subtract(1)).map(function (i) {
+    var s = s0.advance(ee.Number(i), 'day');
+    var e = s.advance(1, 'day');
+    var useAqua = ee.Number(s.millis()).gte(MERGE_FROM_MS);
+    var t = withPriority(terraColl.filterDate(s, e), 1, 1);
+    var a = ee.ImageCollection(ee.Algorithms.If(
+              useAqua, withPriority(aquaColl.filterDate(s, e), 0, 0),
+              ee.ImageCollection([])));
+    var day = t.merge(a);
+
+    return ee.Algorithms.If(day.size().gt(0),
+             day.qualityMosaic('prio').select(['NDSI_Snow_Cover', 'src'])
+                .set('system:time_start', s.millis()),
+             null);
+  });
+  return ee.ImageCollection.fromImages(lst.removeAll([null]));
+}
+
+function windowImage(d0, d1) {
+  var c = mergedDailyColl(d0, d1).map(snowBands);
+  var img = ee.Image(ee.Algorithms.If(c.size().gt(0), c.sum().toFloat(), ZERO6));
+  return img.set('n_images', c.size());
+}
+
+if (DO_BASINS) {
+  basins = buildBasins();
+  print('Basins carried forward (level 5, area and elevation filtered):');
+  print(basins.size());
+
+  BLOCKS.forEach(function (blk) {
+
+    var endMs = Date.UTC(Number(SERIES_END_EXCL.slice(0, 4)),
+                         Number(SERIES_END_EXCL.slice(5, 7)) - 1,
+                         Number(SERIES_END_EXCL.slice(8, 10)));
+    var startList = [];
+    for (var y = blk[0]; y <= blk[1]; y++) {
+      for (var m = 1; m <= 12; m++) {
+        var startMs = Date.UTC(y, m - 1, 1);
+        if (startMs < endMs) { startList.push([y, m]); }
+      }
+    }
+    if (startList.length === 0) { return; }
+
+    var fc = ee.FeatureCollection(startList.map(function (yw) {
+      var y = yw[0], m = yw[1];
+
+      var d0 = ee.Date.fromYMD(y, m, 1);
+
+      var dEnd = ee.Date(SERIES_END_EXCL);
+      var d1m = d0.advance(1, 'month');
+      var d1c = ee.Date(ee.Algorithms.If(d1m.millis().gt(dEnd.millis()), dEnd, d1m));
+
+      var img = windowImage(d0, d1c);
+
+      var stats = img.multiply(ee.Image.pixelArea()).reduceRegions({
+        collection: basins, reducer: ee.Reducer.sum(),
+        scale: SCALE, tileScale: TILE_SCALE
+      });
+      return stats.map(function (f) {
+        var validA = ee.Number(f.get('valid'));
+        var allA   = ee.Number(f.get('all'));
+        var s40A   = ee.Number(f.get('s40'));
+        var aquaA  = ee.Number(f.get('aqua'));
+        var obsFrac = validA.divide(allA.max(1));
+        return ee.Feature(null, {
+          hybas_id: f.get('HYBAS_ID'),
+          sub_area_km2: f.get('SUB_AREA'),
+          mean_elev_m: f.get('mean_elev_m'),
+          forest_frac: f.get('forest_frac'),
+          elev_p10: f.get('elev_p10'),
+          elev_p50: f.get('elev_p50'),
+          elev_p90: f.get('elev_p90'),
+          year: y, month: m,
+          ym: d0.format('YYYY-MM'),
+          date: d0.format('YYYY-MM-dd'),
+          date_end_excl: d1c.format('YYYY-MM-dd'),
+          month_days: d1c.difference(d0, 'day'),
+          n_images: img.get('n_images'),
+
+          valid_km2days: validA.divide(1e6),
+          all_km2days:   allA.divide(1e6),
+          snow_km2days:  s40A.divide(1e6),
+
+          obs_frac: obsFrac,
+
+          obs_ok_030: obsFrac.gte(0.30),
+
+          aqua_km2days:  aquaA.divide(1e6),
+          terra_km2days: validA.subtract(aquaA).divide(1e6),
+          aqua_share:    ee.Algorithms.If(validA.gt(0), aquaA.divide(validA), null),
+
+          snow_frac:     ee.Algorithms.If(validA.gt(0), s40A.divide(validA), null),
+          snow_frac_t30: ee.Algorithms.If(validA.gt(0),
+                            ee.Number(f.get('s30')).divide(validA), null),
+          snow_frac_t50: ee.Algorithms.If(validA.gt(0),
+                            ee.Number(f.get('s50')).divide(validA), null)
+        });
+      });
+    })).flatten();
+
+    Export.table.toDrive({
+      collection: fc,
+      description: 'Iran_SNOWMONTH_MERGED_basin_' + blk[0] + '_' + blk[1],
+      folder: DRIVE_FOLDER,
+      fileNamePrefix: 'Iran_SNOWMONTH_MERGED_basin_' + blk[0] + '_' + blk[1],
+      fileFormat: 'CSV',
+      selectors: ['hybas_id','sub_area_km2','mean_elev_m','forest_frac',
+                  'elev_p10','elev_p50','elev_p90',
+                  'year','month','ym','date','date_end_excl','month_days',
+                  'n_images','valid_km2days','all_km2days','snow_km2days',
+                  'obs_frac','obs_ok_030','terra_km2days','aqua_km2days','aqua_share',
+                  'snow_frac','snow_frac_t30','snow_frac_t50']
+    });
+  });
+}
+
+var ELEV_FLOOR = 1000;
+var ELEV_EDGES = [1000, 1500, 2000, 2500, 3000, 9000];
+
+var ALBORZ_BOX = ee.Geometry.Rectangle([48.0, 35.2, 57.0, 37.5]);
+var ZAGROS_BOX = ee.Geometry.Rectangle([45.0, 28.0, 54.0, 35.5]);
+
+var DOMAINS = [
+  ['Alborz', ALBORZ_BOX.intersection(iran, 100)],
+  ['Zagros', ZAGROS_BOX.difference(ALBORZ_BOX, 100).intersection(iran, 100)]
+];
+
+var bandIdx = ee.Image(0).rename('elev_band');
+for (var bi = 1; bi < ELEV_EDGES.length - 1; bi++) {
+  bandIdx = bandIdx.where(dem.gte(ELEV_EDGES[bi]), bi);
+}
+bandIdx = bandIdx.updateMask(dem.gte(ELEV_FLOOR)).toInt();
+
+if (DO_ELEVBAND) {
+  BLOCKS.forEach(function (blk) {
+    var endMsE = Date.UTC(Number(SERIES_END_EXCL.slice(0, 4)),
+                          Number(SERIES_END_EXCL.slice(5, 7)) - 1,
+                          Number(SERIES_END_EXCL.slice(8, 10)));
+    var startsE = [];
+    for (var y = blk[0]; y <= blk[1]; y++) {
+      for (var w = 0; w < 46; w++) {
+        var ms = Date.UTC(y, 0, 1) + w * WINDOW_DAYS * 86400000;
+        if (ms < endMsE) { startsE.push([y, w]); }
+      }
+    }
+    if (startsE.length === 0) { return; }
+
+    var out = ee.FeatureCollection(startsE.map(function (yw) {
+      var y = yw[0], m = yw[1];
+
+      var d0 = ee.Date.fromYMD(y, m, 1);
+      var dEnd = ee.Date(SERIES_END_EXCL);
+      var d1m = d0.advance(1, 'month');
+      var d1c = ee.Date(ee.Algorithms.If(d1m.millis().gt(dEnd.millis()), dEnd, d1m));
+
+      var img = windowImage(d0, d1c);
+
+      var stacked = img.select(['valid', 's40', 's30', 's50', 'aqua', 'all'])
+                       .multiply(ee.Image.pixelArea())
+                       .addBands(bandIdx);
+
+      return ee.FeatureCollection(DOMAINS.map(function (dm) {
+        var groups = ee.List(ee.Dictionary(stacked.reduceRegion({
+          reducer: ee.Reducer.sum().repeat(6).group({
+            groupField: 6, groupName: 'elev_band'
+          }),
+          geometry: dm[1], scale: SCALE,
+          maxPixels: 1e12, tileScale: TILE_SCALE
+        })).get('groups'));
+
+        return ee.FeatureCollection(groups.map(function (gg) {
+          var d = ee.Dictionary(gg);
+          var sums = ee.List(d.get('sum'));
+          var validA = ee.Number(sums.get(0));
+          var s40A   = ee.Number(sums.get(1));
+          var s30A   = ee.Number(sums.get(2));
+          var s50A   = ee.Number(sums.get(3));
+          var aquaA  = ee.Number(sums.get(4));
+          var allA   = ee.Number(sums.get(5));
+          var obsFrac = validA.divide(allA.max(1));
+          return ee.Feature(null, {
+            domain: dm[0],
+            elev_band: d.get('elev_band'),
+            year: y, month: m,
+            date: d0.format('YYYY-MM-dd'),
+            date_end_excl: d1c.format('YYYY-MM-dd'),
+            month_days: d1c.difference(d0, 'day'),
+            n_images: img.get('n_images'),
+            valid_km2days: validA.divide(1e6),
+            all_km2days:   allA.divide(1e6),
+            snow_km2days:  s40A.divide(1e6),
+
+            band_area_km2: ee.Algorithms.If(
+              ee.Number(img.get('n_images')).gt(0),
+              allA.divide(ee.Number(img.get('n_images'))).divide(1e6), null),
+            obs_frac: obsFrac,
+            obs_ok_030: obsFrac.gte(0.30),
+            aqua_km2days:  aquaA.divide(1e6),
+            terra_km2days: validA.subtract(aquaA).divide(1e6),
+            aqua_share:    ee.Algorithms.If(validA.gt(0), aquaA.divide(validA), null),
+            snow_frac:     ee.Algorithms.If(validA.gt(0), s40A.divide(validA), null),
+            snow_frac_t30: ee.Algorithms.If(validA.gt(0), s30A.divide(validA), null),
+            snow_frac_t50: ee.Algorithms.If(validA.gt(0), s50A.divide(validA), null)
+          });
+        }));
+      })).flatten();
+    })).flatten();
+
+    Export.table.toDrive({
+      collection: out,
+      description: 'Iran_SNOWMERGE_elevband_8day_' + blk[0] + '_' + blk[1],
+      folder: DRIVE_FOLDER,
+      fileNamePrefix: 'Iran_SNOWMERGE_elevband_8day_' + blk[0] + '_' + blk[1],
+      fileFormat: 'CSV',
+      selectors: ['domain','elev_band','band_area_km2','year','window','date',
+                  'date_end_excl','window_days','n_images',
+                  'valid_km2days','all_km2days','snow_km2days',
+                  'obs_frac','obs_ok_030','terra_km2days','aqua_km2days','aqua_share',
+                  'snow_frac','snow_frac_t30','snow_frac_t50']
+    });
+  });
+
+  print('elev_band 0 = 1000-1500 m, 1 = 1500-2000, 2 = 2000-2500, ' +
+        '3 = 2500-3000, 4 = 3000 m and above. Land below 1000 m is excluded.');
+}
+
+if (DO_BASINS) {
+  print('Rows expected in the first basin block (basins x windows):');
+  print(basins.size().multiply(46 * Math.min(BLOCK_YEARS, Y1 - Y0 + 1)));
+}
+
+print('Snow Stage A. DO_BASINS=' + DO_BASINS + '  DO_ELEVBAND=' + DO_ELEVBAND);
+print('Read obs_frac before snow_frac in every row: cloud and snow are not ' +
+      'independent, so a poorly observed window is not a snow-free one. ' +
+      'obs_frac is reported for every window and is NOT a primary filter; forest_frac is ' +
+      'the first thing to check where obs_frac is persistently low.');
