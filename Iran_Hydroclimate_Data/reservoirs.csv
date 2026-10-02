@@ -1,0 +1,13 @@
+reservoir_name,dam_name,longitude,latitude,storage_capacity_km3,capacity_mcm,commission_year,river,country,membership_basis,major_region,snow_link_type,linked_snow_basin_names,published_precedent,res_l5,hybas_l12,reservoir_id
+Dez,Dez,48.460472,32.614789,3.46,3460.0,1962.0,Dez,Iran,dam_in_iran,Persian Gulf,same_L5,Dez-Karun,YES,2050828790,2120788350,1637
+Karoon,Karoon,49.607326,32.052725,3.14,3140.0,1976.0,Karun,Iran,dam_in_iran,Persian Gulf,same_L5,Dez-Karun,NO,2050828790,2120796460,1649
+Sefidrood,Sefidrood,49.385422,36.756244,1.8,1800.0,1961.0,Sefidrood,Iran,dam_in_iran,Caspian Sea,same_L5,Sefid Rud,NO,2050070510,2121256340,1581
+Zayandeh Rood,Zayandeh Rood,50.737929,32.732098,1.45,1450.0,1970.0,Zayanderood,Iran,dam_in_iran,Central Plateau,none,,YES,2050085730,2121283580,1633
+Aras,Aras,45.402083,39.091206,1.35,1350.0,1970.0,Aras,Azerbaijan,documented_shared_border,Caspian Sea,same_L5,Aras,YES,2050643590,2120665370,295
+Doroodzan,Doroodzan,52.41404,30.210342,0.993,993.0,1972.0,Kor,Iran,dam_in_iran,Central Plateau,same_L5,Bakhtegan,YES,2050085930,2120833320,1690
+Lar,Lar,51.992852,35.893851,0.96,960.0,1980.0,Lar,Iran,dam_in_iran,Caspian Sea,same_L5,Lar,YES,2050070520,2120726870,4480
+Zarineh Rood,Zarineh Rood,46.526709,36.421549,0.882,882.0,1971.0,Zarinerood,Iran,dam_in_iran,Lake Urmia,same_L5,Urmia,NO,2050085690,2120716210,1589
+Minab,Minab,57.115407,27.164722,0.344,344.0,1983.0,Minab,Iran,dam_in_iran,Persian Gulf,none,,NO,2050071700,2121325080,1733
+Mahabad,Mahabad,45.701985,36.764462,0.23,230.0,1970.0,Mahabad,Iran,dam_in_iran,Lake Urmia,same_L5,Urmia,YES,2050085690,2120710920,4412
+Gheshlagh,Gheshlagh,46.994144,35.427539,0.224,224.0,1983.0,Gheshlagh,Iran,dam_in_iran,Persian Gulf,same_L5,Sirvan,NO,2050773470,2120732890,4510
+Amir Kabir,Amir Kabir,51.090924,35.957242,0.205,205.0,1963.0,Karaj,Iran,dam_in_iran,Central Plateau,same_L5,Karaj-Jajrud,NO,2050085590,2121261490,4477
